@@ -1,0 +1,36 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+*.egg-info/
+
+# ===== Image datasets (large, should not be pushed to GitHub) =====
+datasets/
+
+# ===== Trained models (large, exceed GitHub's 100MB file limit) =====
+Models/
+*.h5
+*.pt
+*.pth
+*.onnx
+*.weights
+
+# Note: images under "TrainModel Pic/" (training result charts) are NOT ignored,
+# since they are small and useful for illustrating results in the README.
+
+# ===== Jupyter =====
+.ipynb_checkpoints/
+
+# ===== OS / Editor =====
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ===== Logs / output =====
+*.log
+runs/
