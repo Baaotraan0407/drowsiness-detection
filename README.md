@@ -2,7 +2,7 @@
 
 A real-time driver drowsiness detection system that combines **YOLOv8** for face detection, **Haar Cascades** for eye/mouth region extraction, and **lightweight CNNs** for eye-state and yawn classification. The system fuses temporal features (MAR, PERCLOS) with a gaze-down guard to produce a stable drowsiness score, running in real time on CPU-only hardware.
 
-**Authors:** Lam Bao Tran (1113540), Baitikova Bermet (1113531)
+**Authors:** Lam Bao Tran (1113540)
 **Advisor:** Prof. Naeem Ul Islam
 **International Bachelor Program in Informatics (IBPI)**
 
