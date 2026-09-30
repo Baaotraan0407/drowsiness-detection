@@ -17,8 +17,8 @@ class DrowsyConfig:
     # Đường dẫn model
     model_dir: str
     yolov8_face: str = "yolov8-face.pt"
-    eye_keras: str = "eye_detector_gpu.h5"
-    mouth_keras: str = "mouth_detector_gpu.h5"
+    eye_keras: str = "eye_detector.h5"
+    mouth_keras: str = "mouth_detector.h5"
     eye_cascade_xml: str = "haarcascade_eye.xml"
     mouth_cascade_xml: str = "haarcascade_mcs_mouth.xml"
 
