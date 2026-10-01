@@ -1,15 +1,21 @@
 import os
+import sys
 import time
 import argparse
 import logging
+import threading
 from collections import deque
 from dataclasses import dataclass
 
 import cv2
 import numpy as np
 import tensorflow as tf
+import torch
 from ultralytics import YOLO
-import ultralytics as ulx  
+import ultralytics as ulx
+
+# np.trapz bị deprecated ở NumPy 2.x -> dùng np.trapezoid nếu có
+_trapz = getattr(np, "trapezoid", None) or np.trapz
 
 
 @dataclass
@@ -32,8 +38,12 @@ class DrowsyConfig:
     perclos_warmup_sec: float = 20.0
 
     # Eye
+    # eye_detector.h5 output = P(Open)
+    # Hysteresis: P(Open) >= open_thr -> Opened | P(Open) <= closed_thr -> Closed
+    #             ở giữa -> giữ trạng thái trước đó
     eye_continuous_closed_sec: float = 1.5
     eye_open_prob_thr: float = 0.70
+    eye_closed_prob_thr: float = 0.40
     eye_yawn_aid_min_sec: float = 0.2
 
     # Yawn counting
@@ -47,10 +57,11 @@ class DrowsyConfig:
     perclos_yawn_aid_thr: float = 0.20
 
     # Mouth gates
-    mouth_ratio_thr: float = 0.34
+    # MAR ở đây = mouth aspect ratio = chiều cao / chiều rộng của bbox miệng (Haar cascade)
+    mar_thr: float = 0.34
     mouth_prob_thr: float = 0.50
 
-    # Temporal analysis window
+    # Temporal analysis window (tính trên chuỗi MAR)
     mouth_temporal_win: float = 3.0
     speech_peaks_min: int = 4
     speech_zcr_min_hz: float = 2.3
@@ -65,26 +76,74 @@ class DrowsyConfig:
     talking_min_hold_sec: float = 0.6
 
     # EMA smoothing
-    ema_alpha: float = 0.3
+    ema_alpha: float = 0.3               # alpha khi mắt đang MỞ LẠI (làm mượt)
+    eye_ema_alpha_closing: float = 0.7   # alpha khi P(Open) đang GIẢM (phản ứng nhanh khi nhắm)
 
     # Tiền xử lý Keras
     gray_eye: bool = False
     gray_mouth: bool = False
 
+    # Haar eye
+    eye_min_neighbors: int = 4
+    eye_clahe_fallback: bool = False   # đã có ROI dự phòng; CLAHE chạy Haar lần 2 -> chậm
+    # Tần suất chạy pipeline mắt / miệng (Haar + CNN). Frame còn lại dùng kết quả cache.
+    # Mắt chạy ở frame chẵn, miệng chạy ở frame lẻ (so le để dàn đều tải).
+    eye_every_n: int = 1               # CNN mắt rẻ (64x64) -> chạy mỗi frame để bắt nhắm mắt nhanh
+    mouth_every_n: int = 2
+    eye_haar_every_n: int = 3          # Haar mắt (tốn hơn) chỉ chạy mỗi N lần để định vị, giữa chừng dùng 'track'
+    haar_work_width: int = 200         # thu nhỏ ảnh xám về bề rộng này trước khi Haar (0 = tắt)
+
+    # Chẩn đoán CNN (dùng khi nhận diện Closed/Open bị sai)
+    eye_rgb: bool = False              # BGR -> RGB trước khi đưa vào eye CNN
+    mouth_rgb: bool = False            # BGR -> RGB trước khi đưa vào mouth CNN
+    eye_invert: bool = False           # True nếu output eye model thực ra là P(Closed)
+    # Haar (train trên mắt mở) hay miss khi mắt NHẮM -> dùng ROI dự phòng để CNN quyết định
+    eye_roi_fallback: bool = True
+    # Haar miệng hay miss khi miệng há to (ngáp) -> dùng ROI dự phòng để CNN quyết định
+    mouth_roi_fallback: bool = True
+
     # Guard "nhìn xuống"
+    use_gaze_guard: bool = False
     gaze_down_ratio: float = 0.85
-    eye_closed_debounce_sec: float = 0.30
     gaze_down_min_delta: float = 0.08
     gaze_min_brightness: float = 20.0
+    # Nếu P(Open) (EMA) <= giá trị này thì vẫn coi là Closed dù đang gaze-down
+    gaze_guard_override_prob: float = 0.15
+
+    # Debounce: Closed phải kéo dài liên tục ít nhất N giây mới được xác nhận
+    eye_closed_debounce_sec: float = 0.15
 
     # YOLO threshold (CLI)
     yolo_conf: float = 0.50
     yolo_iou: float = 0.45
+    # YOLO device: auto = CUDA nếu có, ngược lại CPU. Có thể override bằng CLI.
+    yolo_device: str = "auto"
 
     # Recovery settings
     recovery_duration_sec: float = 3.0       # thời gian giữ điều kiện recovery
     recovery_perclos_thr: float = 0.15       # PERCLOS < 15%
     recovery_yawn_cooldown: float = 3.0      # không ngáp trong N giây
+
+    # Drowsiness score: score = max(eye, perclos, yawn) đã chuẩn hóa về [0, 1]
+    # Cảnh báo khi score >= drowsy_score_thr (nên để 1.0 = ngưỡng của từng thành phần)
+    drowsy_score_thr: float = 1.0
+
+    # Audio alert
+    enable_audio: bool = True
+    audio_cooldown_sec: float = 1.0
+    # Không bíp khi đang đếm recovery nếu True
+    mute_audio_during_recovery: bool = True
+
+
+def _default_model_dir():
+    """MODEL_DIR (env) -> 'Models' -> 'models' -> 'Models'."""
+    env = os.getenv("MODEL_DIR")
+    if env:
+        return env
+    for cand in ("Models", "models"):
+        if os.path.isdir(cand):
+            return cand
+    return "Models"
 
 
 def _largest_box(boxes):
@@ -105,10 +164,90 @@ def _resize_keep_aspect(img, new_w):
     return small, r
 
 
+def resolve_torch_device(requested="auto"):
+    """Tự chọn device cho YOLO/PyTorch.
+
+    auto  -> cuda:0 nếu CUDA khả dụng, ngược lại cpu.
+    cuda  -> cuda:0 nếu CUDA khả dụng, ngược lại fallback cpu.
+    cuda:N -> dùng GPU N nếu CUDA khả dụng.
+    cpu   -> luôn dùng CPU.
+    """
+    requested = str(requested or "auto").strip().lower()
+    cuda_available = torch.cuda.is_available()
+
+    if requested == "auto":
+        return "cuda:0" if cuda_available else "cpu"
+
+    if requested == "cuda":
+        if cuda_available:
+            return "cuda:0"
+        logging.warning("YOLO requested CUDA but CUDA is unavailable. Falling back to CPU.")
+        return "cpu"
+
+    if requested.startswith("cuda:"):
+        if cuda_available:
+            try:
+                index = int(requested.split(":", 1)[1])
+                if 0 <= index < torch.cuda.device_count():
+                    return requested
+            except (ValueError, TypeError):
+                pass
+        logging.warning("YOLO requested device '%s' but it is unavailable. Falling back to CPU.", requested)
+        return "cpu"
+
+    return "cpu"
+
+
+class AlarmSound:
+    """Cảnh báo âm thanh không chặn luồng chính (chạy trong thread riêng)."""
+
+    def __init__(self, enabled=True, cooldown=1.0):
+        self.enabled = enabled
+        self.cooldown = cooldown
+        self._last_ts = 0.0
+        self._busy = False
+
+    def _beep(self):
+        try:
+            if sys.platform.startswith("win"):
+                import winsound
+                winsound.Beep(1000, 400)
+            elif sys.platform == "darwin":
+                os.system("afplay /System/Library/Sounds/Funk.aiff >/dev/null 2>&1")
+            else:
+                sys.stdout.write("\a")
+                sys.stdout.flush()
+        except Exception:
+            pass
+        finally:
+            self._busy = False
+
+    def play(self, now):
+        if not self.enabled or self._busy:
+            return
+        if (now - self._last_ts) < self.cooldown:
+            return
+        self._last_ts = now
+        self._busy = True
+        threading.Thread(target=self._beep, daemon=True).start()
+
+
 class DrowsinessDetector:
     def __init__(self, cfg: DrowsyConfig, save_csv_path: str = None):
         self.cfg = cfg
         self.save_csv_path = save_csv_path
+
+        # Auto-select YOLO/PyTorch device. TensorFlow eye/mouth models keep
+        # their own device selection based on the installed TensorFlow build.
+        self.torch_device = resolve_torch_device(cfg.yolo_device)
+        if self.torch_device.startswith("cuda"):
+            try:
+                gpu_name = torch.cuda.get_device_name(int(self.torch_device.split(":")[1]))
+            except Exception:
+                gpu_name = "CUDA GPU"
+            logging.info("YOLO device selected: %s (%s)", self.torch_device, gpu_name)
+        else:
+            logging.info("YOLO device selected: CPU")
 
         # Đường dẫn
         self.face_model_path = os.path.join(cfg.model_dir, cfg.yolov8_face)
@@ -131,14 +270,28 @@ class DrowsinessDetector:
 
         # model
         self.face_model = YOLO(self.face_model_path, task='detect')
+        try:
+            self.face_model.to(self.torch_device)
+        except Exception as e:
+            if self.torch_device != "cpu":
+                logging.warning(
+                    "Could not move YOLO to %s (%s). Falling back to CPU.",
+                    self.torch_device, e
+                )
+                self.torch_device = "cpu"
+                self.face_model.to("cpu")
+            else:
+                raise
         self.eye_model = tf.keras.models.load_model(self.eye_model_path)
         self.mouth_model = tf.keras.models.load_model(self.mouth_model_path)
 
-        # Warmup
-        dummy_ch = 1 if (cfg.gray_eye or cfg.gray_mouth) else 3
-        dummy = tf.zeros((1, 64, 64, dummy_ch), dtype=tf.float32)
-        _ = self.eye_model(dummy, training=False)
-        _ = self.mouth_model(dummy, training=False)
+        # Warmup (mỗi model một số kênh riêng theo cờ gray tương ứng)
+        ch_eye = 1 if cfg.gray_eye else 3
+        ch_mouth = 1 if cfg.gray_mouth else 3
+        self._eye_fn = tf.function(lambda x: self.eye_model(x, training=False), reduce_retracing=True)
+        self._mouth_fn = tf.function(lambda x: self.mouth_model(x, training=False), reduce_retracing=True)
+        _ = self._eye_fn(tf.zeros((1, 64, 64, ch_eye), dtype=tf.float32))
+        _ = self._mouth_fn(tf.zeros((1, 64, 64, ch_mouth), dtype=tf.float32))
 
         # cascade
         self.eye_cascade = cv2.CascadeClassifier(self.eye_cascade_path)
@@ -152,21 +305,39 @@ class DrowsinessDetector:
         self.colors = {'face': (255, 0, 0), 'eye': (0, 0, 255), 'mouth': (0, 255, 255)}
         self.font = cv2.FONT_HERSHEY_SIMPLEX
 
+        # Audio
+        self.alarm = AlarmSound(enabled=cfg.enable_audio, cooldown=cfg.audio_cooldown_sec)
+
         # Trạng thái
         self.frame_idx = 0
         self.last_face_bbox = None
         self._face_bbox_ema = None
 
+        # Eye state
         self.eye_closed_frames = 0
         self.perclos_hist = deque(maxlen=4000)  # (ts, True/False/None)
         self.eye_closed_start_ts = None
         self._eye_closed_debounce_ts = None
+        self.eye_state = None          # trạng thái "raw" từ CNN + hysteresis
+        self._eye_final_state = None   # trạng thái sau gaze guard + debounce
+        self.eye_prob_ema = None
+        self.last_eye_prob = None
+        self.last_eye_source = "none"
+        self.last_gaze_down_like = False
+        self.last_eye_crop = None
+        self.last_mouth_crop = None
+        self.last_mouth_source = "none"
+        self._last_mouth_rel = None
+        self._eye_run_idx = 0
+        self._cached_eye_status = None
+        self._cached_mouth = None      # (status, mar, prob_yawn)
+        self._last_eye_rel = None      # (x, y, w, h) tương đối trong eye_region, lần Haar bắt được gần nhất
 
         self.yawn_active = False
         self.yawn_start_ts = None
         self.yawn_events = deque()
 
-        self.mouth_ratio_hist = deque(maxlen=1000)
+        self.mar_hist = deque(maxlen=1000)
         self.mouth_prob_hist = deque(maxlen=1000)
         self.mouth_open_start_ts = None
         self.mouth_yawn_start_ts = None
@@ -175,8 +346,7 @@ class DrowsinessDetector:
 
         self.alert_on = False
         self.alert_cross_ts = None
-
-        self.eye_prob_ema = None
+        self.last_score = 0.0
 
         # Recovery state
         self.recovery_start_ts = None
@@ -193,7 +363,8 @@ class DrowsinessDetector:
         # CSV logging
         if self.save_csv_path:
             with open(self.save_csv_path, "w", encoding="utf-8") as f:
-                f.write("ts,perclos,eye_status,mouth_status,mouth_ratio,mouth_prob,plateau,zcr,peaks,above,status\n")
+                f.write("ts,perclos,perclos_span,eye_status,eye_prob,eye_prob_ema,eye_source,"
+                        "mouth_status,mar,mouth_prob,plateau,zcr,peaks,above,score,status\n")
 
         logging.info("DrowsinessDetector initialized.")
 
@@ -246,7 +417,13 @@ class DrowsinessDetector:
 
         if do_detect:
             small, r = _resize_keep_aspect(frame, self.cfg.yolo_downscale_width)
-            res = self.face_model(small, conf=self.cfg.yolo_conf, iou=self.cfg.yolo_iou, verbose=False)
+            res = self.face_model.predict(
+                source=small,
+                conf=self.cfg.yolo_conf,
+                iou=self.cfg.yolo_iou,
+                device=self.torch_device,
+                verbose=False,
+            )
             best, best_area = None, 0
             for r0 in res:
                 if not hasattr(r0, 'boxes') or r0.boxes is None:
@@ -282,108 +459,243 @@ class DrowsinessDetector:
         face_roi = frame[y1:y2, x1:x2]
         return face_roi, (x1, y1, x2, y2)
 
-    def _prep_keras_input(self, crop_bgr, to_gray: bool):
+    def _prep_keras_input(self, crop_bgr, to_gray: bool, to_rgb: bool = False):
         if to_gray:
             x = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY)
             x = cv2.resize(x, (64, 64)).astype(np.float32) / 255.0
             x = np.expand_dims(x, axis=(0, -1))
         else:
+            if to_rgb:
+                crop_bgr = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
             x = cv2.resize(crop_bgr, (64, 64)).astype(np.float32) / 255.0
             x = np.expand_dims(x, axis=0)
         return tf.convert_to_tensor(x)
 
+    def _haar(self, cascade, gray, scale_factor, min_neighbors, use_min_size=True):
+        """Haar trên ảnh đã thu nhỏ (nhanh hơn nhiều), trả về box (x, y, w, h) theo ảnh gốc."""
+        work_w = self.cfg.haar_work_width
+        h, w = gray.shape[:2]
+        s = work_w / float(w) if (work_w > 0 and w > work_w) else 1.0
+        small = cv2.resize(gray, (max(1, int(w * s)), max(1, int(h * s)))) if s != 1.0 else gray
+
+        kwargs = {}
+        if use_min_size:
+            kwargs["minSize"] = (max(12, small.shape[1] // 12), max(8, small.shape[0] // 16))
+
+        boxes = cascade.detectMultiScale(small, scaleFactor=scale_factor,
+                                         minNeighbors=min_neighbors, **kwargs)
+        sel = _largest_box(boxes)
+        if sel is None:
+            return None
+        x, y, bw, bh = (int(v / s) for v in sel)
+        return (x, y, max(1, bw), max(1, bh))
+
     def _detect_eyes(self, face_roi):
-        """Trả về: 'Opened' | 'Closed' | 'Unknown' (Unknown không cộng PERCLOS)"""
-        status = "Closed"
+        """Trả về: 'Opened' | 'Closed' | 'Unknown'.
+
+        Haar eye cascade train trên mắt MỞ nên thường miss khi mắt nhắm. Vì vậy:
+          - Haar chạy mỗi eye_haar_every_n frame để cập nhật vị trí mắt,
+          - các frame còn lại (và khi Haar miss) dùng lại vị trí gần nhất ('track'),
+          - CNN luôn quyết định Opened/Closed trên ROI đó.
+        'Unknown' chỉ khi không có ROI hợp lệ, hoặc gaze guard / debounce đang giữ lại.
+        """
+        cfg = self.cfg
+        self.last_eye_crop = None
+        self._eye_run_idx += 1
+
         if face_roi is None or face_roi.size == 0:
-            return status
+            self.last_eye_source = "none"
+            self.last_eye_prob = None
+            self.last_gaze_down_like = False
+            self._eye_closed_debounce_ts = None
+            self._eye_final_state = "Unknown"
+            return "Unknown"
 
-        eye_region = face_roi[: face_roi.shape[0] // 2, :]
+        # Vùng nửa trên khuôn mặt
+        eye_region = face_roi[: int(face_roi.shape[0] * 0.60), :]
+        rh, rw = eye_region.shape[:2]
         gray_eye = cv2.cvtColor(eye_region, cv2.COLOR_BGR2GRAY)
-        eyes = self.eye_cascade.detectMultiScale(gray_eye, scaleFactor=1.1, minNeighbors=5)
-        sel = _largest_box(eyes)
-        if sel is not None:
-            ex, ey, ew, eh = sel
-            eye_crop = eye_region[ey:ey+eh, ex:ex+ew]
 
-            # Model prob (eager)
-            eye_inp = self._prep_keras_input(eye_crop, to_gray=self.cfg.gray_eye)
-            prob_open = float(self.eye_model(eye_inp, training=False).numpy()[0][0])
+        sel = None
+        source = "haar"
+        run_haar = (self._last_eye_rel is None) or (self._eye_run_idx % max(1, cfg.eye_haar_every_n) == 0)
 
-            # EMA smoothing
-            a = self.cfg.ema_alpha
-            self.eye_prob_ema = prob_open if self.eye_prob_ema is None else (a*prob_open + (1-a)*self.eye_prob_ema)
+        if run_haar:
+            sel = self._haar(self.eye_cascade, gray_eye, 1.08, cfg.eye_min_neighbors)
+            if sel is None and cfg.eye_clahe_fallback:
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                sel = self._haar(self.eye_cascade, clahe.apply(gray_eye), 1.05,
+                                 max(3, cfg.eye_min_neighbors - 1))
+                if sel is not None:
+                    source = "haar+clahe"
+            if sel is not None:
+                self._last_eye_rel = (sel[0] / rw, sel[1] / rh, sel[2] / rw, sel[3] / rh)
 
-            # -------- GAZE-DOWN GUARD (nhìn xuống bàn phím) --------
-            g = cv2.cvtColor(eye_crop, cv2.COLOR_BGR2GRAY)
-            h2 = g.shape[0] // 2
-            top_mean = float(np.mean(g[:h2, :])) + 1e-6
-            bot_mean = float(np.mean(g[h2:, :])) + 1e-6
-            rel_delta = (top_mean - bot_mean) / max(1e-6, top_mean)
-            # <<< NEW: clamp theo delta & sàn sáng
-            gaze_down_like = (top_mean >= self.cfg.gaze_min_brightness and
-                              rel_delta >= self.cfg.gaze_down_min_delta and
-                              bot_mean < self.cfg.gaze_down_ratio * top_mean)
-
-            # Debounce "Closed" ≥ eye_closed_debounce_sec
-            now = time.time()
-            closed_now = (self.eye_prob_ema < self.cfg.eye_open_prob_thr)
-            if closed_now and self._eye_closed_debounce_ts is None:
-                self._eye_closed_debounce_ts = now
-            if not closed_now:
-                self._eye_closed_debounce_ts = None
-            closed_debounced = (closed_now and
-                                self._eye_closed_debounce_ts is not None and
-                                (now - self._eye_closed_debounce_ts) >= self.cfg.eye_closed_debounce_sec)
-
-            if gaze_down_like and closed_now and not closed_debounced:
-                status = "Unknown"   # => không tính PERCLOS
+        if sel is None and cfg.eye_roi_fallback:
+            if self._last_eye_rel is not None:
+                fx, fy, fw, fh = self._last_eye_rel
+                source = "track"
             else:
-                status = "Opened" if self.eye_prob_ema >= self.cfg.eye_open_prob_thr \
-                         else ("Closed" if closed_debounced else "Unknown")
-        return status
+                fx, fy, fw, fh = 0.12, 0.45, 0.34, 0.40
+                source = "default"
+            sel = (int(fx * rw), int(fy * rh), max(8, int(fw * rw)), max(8, int(fh * rh)))
 
+        # Không có ROI (tắt fallback) -> Unknown (KHÔNG coi là Closed)
+        if sel is None:
+            self.last_eye_source = "miss"
+            self.last_eye_prob = None
+            self.last_gaze_down_like = False
+            self._eye_closed_debounce_ts = None
+            self._eye_final_state = "Unknown"
+            return "Unknown"
 
+        ex, ey, ew, eh = sel
+        eye_crop = eye_region[ey:ey + eh, ex:ex + ew]
+        if eye_crop.size == 0:
+            self.last_eye_source = "invalid"
+            self.last_eye_prob = None
+            self._eye_closed_debounce_ts = None
+            self._eye_final_state = "Unknown"
+            return "Unknown"
 
+        self.last_eye_crop = eye_crop
 
+        # CNN
+        eye_inp = self._prep_keras_input(eye_crop, to_gray=cfg.gray_eye, to_rgb=cfg.eye_rgb)
+        prob_open = float(self._eye_fn(eye_inp).numpy()[0][0])
+        if cfg.eye_invert:
+            prob_open = 1.0 - prob_open
+        self.last_eye_prob = prob_open
+        self.last_eye_source = source
+
+        # EMA smoothing
+        if self.eye_prob_ema is None:
+            self.eye_prob_ema = prob_open
+        else:
+            # Đang nhắm (P giảm) -> alpha lớn để phản ứng nhanh; đang mở lại -> alpha nhỏ để mượt
+            a = cfg.eye_ema_alpha_closing if prob_open < self.eye_prob_ema else cfg.ema_alpha
+            a = float(np.clip(a, 0.0, 1.0))
+            self.eye_prob_ema = a * prob_open + (1 - a) * self.eye_prob_ema
+        p = float(self.eye_prob_ema)
+
+        # -------- GAZE-DOWN (nhìn xuống bàn phím) --------
+        g = cv2.cvtColor(eye_crop, cv2.COLOR_BGR2GRAY)
+        h2 = max(1, g.shape[0] // 2)
+        top_mean = float(np.mean(g[:h2, :])) + 1e-6
+        bot_mean = float(np.mean(g[h2:, :])) + 1e-6
+        rel_delta = (top_mean - bot_mean) / max(1e-6, top_mean)
+        gaze_down_like = (top_mean >= cfg.gaze_min_brightness and
+                          rel_delta >= cfg.gaze_down_min_delta and
+                          bot_mean < cfg.gaze_down_ratio * top_mean)
+        self.last_gaze_down_like = gaze_down_like
+
+        # -------- Hysteresis: self.eye_state là trạng thái raw --------
+        if p >= cfg.eye_open_prob_thr:
+            self.eye_state = "Opened"
+        elif p <= cfg.eye_closed_prob_thr:
+            self.eye_state = "Closed"
+        elif self.eye_state is None:
+            self.eye_state = "Unknown"
+
+        raw_state = self.eye_state
+        now = time.time()
+
+        # -------- Gaze guard: chỉ chặn khi mắt chưa nhắm "chắc chắn" --------
+        if (raw_state == "Closed" and cfg.use_gaze_guard and gaze_down_like
+                and p > cfg.gaze_guard_override_prob):
+            self._eye_closed_debounce_ts = None
+            self._eye_final_state = "Unknown"
+            return "Unknown"
+
+        # -------- Debounce Closed --------
+        if raw_state == "Closed":
+            if self._eye_closed_debounce_ts is None:
+                self._eye_closed_debounce_ts = now
+            if (now - self._eye_closed_debounce_ts) >= cfg.eye_closed_debounce_sec:
+                final_state = "Closed"
+            else:
+                final_state = (self._eye_final_state
+                               if self._eye_final_state in ("Opened", "Unknown") else "Unknown")
+        else:
+            self._eye_closed_debounce_ts = None
+            final_state = raw_state
+
+        self._eye_final_state = final_state
+        return final_state
 
     def _detect_mouth(self, face_roi):
-        """Return (status, ratio, prob_yawn, open_dur)."""
+        """Return (status, mar, prob_yawn, open_dur).
+
+        Haar mouth cascade hay miss khi miệng há to. Khi miss: dùng lại vị trí miệng gần nhất
+        (mở rộng chiều cao) hoặc ROI mặc định, và để CNN quyết định. Lúc đó MAR từ bbox không
+        còn đáng tin nên dùng 'pseudo-MAR' suy ra từ prob_yawn của CNN.
+        """
+        cfg = self.cfg
         status = "Normal"
-        ratio = 0.0
+        mar = 0.0
         prob_yawn = 0.0
         open_dur = 0.0
         now = time.time()
+        self.last_mouth_crop = None
 
         if face_roi is None or face_roi.size == 0:
+            self.last_mouth_source = "none"
             self.mouth_open_start_ts = None
             self.mouth_yawn_start_ts = None
-            return status, ratio, prob_yawn, open_dur
+            return status, mar, prob_yawn, open_dur
 
         mouth_region = face_roi[face_roi.shape[0] // 3 :, :]
+        rh, rw = mouth_region.shape[:2]
         gray_mouth = cv2.cvtColor(mouth_region, cv2.COLOR_BGR2GRAY)
-        mouths = self.mouth_cascade.detectMultiScale(gray_mouth, scaleFactor=1.1, minNeighbors=5)
 
-        sel = _largest_box(mouths)
+        sel = self._haar(self.mouth_cascade, gray_mouth, 1.1, 5, use_min_size=False)
         if sel is None:
             self._mouth_miss_streak += 1
             if self._mouth_miss_streak >= 5:
                 clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-                gray2 = clahe.apply(gray_mouth)
-                mouths2 = self.mouth_cascade.detectMultiScale(gray2, scaleFactor=1.1, minNeighbors=3)
-                sel = _largest_box(mouths2)
+                sel = self._haar(self.mouth_cascade, clahe.apply(gray_mouth), 1.1, 3, use_min_size=False)
         else:
             self._mouth_miss_streak = 0
 
+        source = "haar"
+        if sel is not None:
+            self._last_mouth_rel = (sel[0] / rw, sel[1] / rh, sel[2] / rw, sel[3] / rh)
+        elif cfg.mouth_roi_fallback:
+            if self._last_mouth_rel is not None:
+                fx, fy, fw, fh = self._last_mouth_rel
+                # Miệng đang há to -> mở rộng chiều cao quanh tâm cũ
+                cy = fy + fh / 2.0
+                fh = min(1.0, max(fh * 1.8, 0.35))
+                fy = max(0.0, min(1.0 - fh, cy - fh / 2.0))
+                source = "track"
+            else:
+                fx, fy, fw, fh = 0.25, 0.40, 0.50, 0.50
+                source = "default"
+            sel = (int(fx * rw), int(fy * rh), max(8, int(fw * rw)), max(8, int(fh * rh)))
+
+        crop = None
         if sel is not None:
             mx, my, mw, mh = sel
             crop = mouth_region[my:my + mh, mx:mx + mw]
+            if crop.size == 0:
+                crop = None
 
-            mouth_inp = self._prep_keras_input(crop, to_gray=self.cfg.gray_mouth)
-            prob_yawn = float(self.mouth_model(mouth_inp, training=False).numpy()[0][0])
+        self.last_mouth_source = source if crop is not None else "miss"
 
-            ratio = mh / max(1.0, mw)
-            mouth_open_now = (ratio >= self.cfg.mouth_ratio_thr) and (prob_yawn >= self.cfg.mouth_prob_thr)
+        if crop is not None:
+            self.last_mouth_crop = crop
+            mouth_inp = self._prep_keras_input(crop, to_gray=cfg.gray_mouth, to_rgb=cfg.mouth_rgb)
+            prob_yawn = float(self._mouth_fn(mouth_inp).numpy()[0][0])
+
+            if source == "haar":
+                mar = mh / max(1.0, mw)
+                open_gate = mar >= cfg.mar_thr
+            else:
+                # Không có MAR đáng tin -> để CNN quyết định
+                open_gate = True
+                mar = (cfg.mar_thr + 0.05) if prob_yawn >= cfg.mouth_prob_thr else 0.0
+
+            mouth_open_now = open_gate and (prob_yawn >= cfg.mouth_prob_thr)
 
             if mouth_open_now:
                 if self.mouth_open_start_ts is None:
@@ -391,14 +703,14 @@ class DrowsinessDetector:
                 open_dur = now - self.mouth_open_start_ts
                 status = "Opening"
 
-                if open_dur > self.cfg.yawn_sure_open_sec:
+                if open_dur > cfg.yawn_sure_open_sec:
                     status = "Yawn"
                     if self.mouth_yawn_start_ts is None:
                         self.mouth_yawn_start_ts = now
             else:
                 if self.mouth_open_start_ts is not None:
                     open_dur = now - self.mouth_open_start_ts
-                    if open_dur > self.cfg.yawn_sure_open_sec and self.mouth_yawn_start_ts is not None:
+                    if open_dur > cfg.yawn_sure_open_sec and self.mouth_yawn_start_ts is not None:
                         status = "Yawn"
                     else:
                         status = "Normal"
@@ -412,11 +724,12 @@ class DrowsinessDetector:
             self.mouth_yawn_start_ts = None
             status = "Normal"
 
-        return status, ratio, prob_yawn, open_dur
+        return status, mar, prob_yawn, open_dur
 
-    def _analyze_mouth_temporal(self, now, ratio_thr):
+    def _analyze_mouth_temporal(self, now, mar_thr):
+        """Đặc trưng thời gian trên chuỗi MAR: plateau, ZCR, peaks, area, above-threshold."""
         WIN = float(self.cfg.mouth_temporal_win)
-        xs = [(t, r) for (t, r) in self.mouth_ratio_hist if t >= now - WIN]
+        xs = [(t, r) for (t, r) in self.mar_hist if t >= now - WIN]
         if len(xs) < 3:
             return {
                 "yawn_like": False,
@@ -432,13 +745,13 @@ class DrowsinessDetector:
         ts = np.array([t for (t, _) in xs], dtype=np.float32)
         rs = np.array([r for (_, r) in xs], dtype=np.float32)
 
-        above = rs >= ratio_thr
+        above = rs >= mar_thr
         above_frac = float(np.mean(above))
 
         plateau_max = 0.0
         area = 0.0
         if above.any():
-            area = float(np.trapz(np.maximum(0.0, rs - ratio_thr), ts))
+            area = float(_trapz(np.maximum(0.0, rs - mar_thr), ts))
             start = None
             frame_dt = float(np.median(np.diff(ts))) if len(ts) > 1 else 0.0
             for i, v in enumerate(above):
@@ -459,7 +772,7 @@ class DrowsinessDetector:
         margin = 0.02
         prom = 0.04
         for i in range(1, len(rs) - 1):
-            if rs[i] >= ratio_thr + margin and rs[i] > rs[i - 1] and rs[i] > rs[i + 1]:
+            if rs[i] >= mar_thr + margin and rs[i] > rs[i - 1] and rs[i] > rs[i + 1]:
                 local_prom = rs[i] - min(rs[i - 1], rs[i + 1])
                 if local_prom >= prom:
                     peaks += 1
@@ -488,6 +801,30 @@ class DrowsinessDetector:
             "above_frac": float(above_frac),
         }
 
+    def _compute_drowsy_score(self, now, perclos, perclos_ready, yawn_count):
+        """Drowsiness score trong [0, 1].
+
+        Mỗi thành phần được chuẩn hóa sao cho = 1.0 đúng tại ngưỡng cảnh báo:
+          - eye:    thời gian nhắm mắt liên tục / eye_continuous_closed_sec
+          - perclos: PERCLOS / perclos_thr (chỉ tính sau warmup)
+          - yawn:   max(số ngáp / yawn_count_thr, thời lượng ngáp đang diễn ra / yawn_min_duration_sec)
+        Score = max của 3 thành phần.
+        """
+        cfg = self.cfg
+
+        eye_dur = (now - self.eye_closed_start_ts) if self.eye_closed_start_ts is not None else 0.0
+        s_eye = eye_dur / max(1e-6, cfg.eye_continuous_closed_sec)
+
+        s_perclos = (perclos / max(1e-6, cfg.perclos_thr)) if perclos_ready else 0.0
+
+        yawn_dur = (now - self.yawn_start_ts) if (self.yawn_active and self.yawn_start_ts is not None) else 0.0
+        s_yawn = max(yawn_count / max(1, cfg.yawn_count_thr),
+                     yawn_dur / max(1e-6, cfg.yawn_min_duration_sec))
+
+        score = min(1.0, max(s_eye, s_perclos, s_yawn))
+        parts = {"eye": min(1.0, s_eye), "perclos": min(1.0, s_perclos), "yawn": min(1.0, s_yawn)}
+        return score, parts
+
     def _update_alert(self, should_alarm, now):
         if not self.alert_on:
             if should_alarm:
@@ -515,28 +852,50 @@ class DrowsinessDetector:
 
         # No-Update Mode khi mất mặt
         if face_roi is None:
+            # Reset timer nhắm mắt để không bị "dính" giá trị cũ khi mặt xuất hiện lại
+            self.eye_closed_start_ts = None
+            self.eye_closed_frames = 0
+            self._eye_closed_debounce_ts = None
+            self._eye_final_state = "Unknown"
+            self._cached_eye_status = None
+            self._cached_mouth = None
+
             perclos, _ = self._update_perclos(now, None)
             self._update_yawn_events(now)
             yawn_count = len(self.yawn_events)
             status = "DROWSY" if self.alert_on else "AWAKE"
+            if self.alert_on:
+                self.alarm.play(now)
             cv2.putText(frame, "Face: missing", (10, 30), self.font, 0.7, (0, 255, 255), 2)
             self._draw_overlay(frame, bbox=None, eye_status="-", mouth_status="-",
                                perclos=perclos, yawn_count=yawn_count, status=status,
-                               mouth_dbg=None, open_dur=0.0)
+                               mouth_dbg=None, open_dur=0.0, score=self.last_score)
             self._update_fps()
             return frame
 
         (x1, y1, x2, y2) = bbox
         cv2.rectangle(frame, (x1, y1), (x2, y2), self.colors['face'], 2)
 
-        # Eyes
-        eye_status = self._detect_eyes(face_roi)
+        # Eyes (Haar + CNN) — chạy mỗi eye_every_n frame, còn lại dùng cache
+        run_eye = (self._cached_eye_status is None) or (self.frame_idx % max(1, self.cfg.eye_every_n) == 0)
+        if run_eye:
+            eye_status = self._detect_eyes(face_roi)
+            self._cached_eye_status = eye_status
+        else:
+            eye_status = self._cached_eye_status
 
-        # Mouth
-        mouth_status, mouth_ratio, prob_yawn, open_dur = self._detect_mouth(face_roi)
-        self.mouth_ratio_hist.append((now, float(mouth_ratio)))
-        self.mouth_prob_hist.append((now, float(prob_yawn)))
-        mt = self._analyze_mouth_temporal(now, ratio_thr=self.cfg.mouth_ratio_thr)
+        # Mouth (Haar + CNN) — chạy mỗi mouth_every_n frame (so le với mắt), còn lại dùng cache
+        run_mouth = (self._cached_mouth is None) or ((self.frame_idx + 1) % max(1, self.cfg.mouth_every_n) == 0)
+        if run_mouth:
+            mouth_status, mar, prob_yawn, open_dur = self._detect_mouth(face_roi)
+            self._cached_mouth = (mouth_status, mar, prob_yawn)
+            # Chỉ ghi chuỗi MAR khi có đo mới (tránh lặp giá trị làm sai ZCR/peaks)
+            self.mar_hist.append((now, float(mar)))
+            self.mouth_prob_hist.append((now, float(prob_yawn)))
+        else:
+            mouth_status, mar, prob_yawn = self._cached_mouth
+            open_dur = (now - self.mouth_open_start_ts) if self.mouth_open_start_ts is not None else 0.0
+        mt = self._analyze_mouth_temporal(now, mar_thr=self.cfg.mar_thr)
 
         # Eye state tracking
         if eye_status == "Closed":
@@ -547,7 +906,7 @@ class DrowsinessDetector:
             self.eye_closed_start_ts = None
             self.eye_closed_frames = 0
 
-        # PERCLOS dùng None khi Unknown
+        # PERCLOS: Closed -> True, Opened -> False, Unknown -> None
         is_closed_flag = True if eye_status == "Closed" else (False if eye_status == "Opened" else None)
         perclos, span = self._update_perclos(now, is_closed_flag)
 
@@ -589,29 +948,20 @@ class DrowsinessDetector:
         self._update_yawn_events(now)
         yawn_count = len(self.yawn_events)
 
-        # Alarm logic
-        long_eye_close = (self.eye_closed_start_ts is not None and
-                          (now - self.eye_closed_start_ts) >= self.cfg.eye_continuous_closed_sec)
-        perclos_alarm = (perclos_ready and perclos >= self.cfg.perclos_thr)
-        yawn_alarm = (yawn_count >= self.cfg.yawn_count_thr) or \
-                     (self.yawn_active and self.yawn_start_ts is not None and
-                      (now - self.yawn_start_ts) >= self.cfg.yawn_min_duration_sec)
+        # ---- Drowsiness score (PERCLOS + eye-closure + yawn) ----
+        score, _parts = self._compute_drowsy_score(now, perclos, perclos_ready, yawn_count)
+        self.last_score = score
+        drowsy_raw = score >= self.cfg.drowsy_score_thr
 
-        drowsy_raw = long_eye_close or perclos_alarm or yawn_alarm
-
-        # RECOVERY LOGIC TỐI ƯU 
+        # RECOVERY LOGIC
         # 1) Eye: Opened
         # 2) Mouth: không Yawn
         # 3) PERCLOS: < threshold HOẶC chưa warmup
         # 4) Không có ngáp mới trong cooldown period
-
         eyes_ok = (eye_status == "Opened")
         mouth_ok = (mouth_status != "Yawn")
-
-        # PERCLOS check: nếu chưa warmup thì coi như OK
         perclos_ok = (not perclos_ready) or (perclos < self.cfg.recovery_perclos_thr)
 
-        # Yawn cooldown check
         if self.yawn_events:
             last_yawn_age = now - self.yawn_events[-1]
         else:
@@ -621,7 +971,6 @@ class DrowsinessDetector:
         recovery_ready = eyes_ok and mouth_ok and perclos_ok and no_recent_yawn
 
         if recovery_ready:
-            # Bắt đầu đếm thời gian recovery
             if self.recovery_start_ts is None:
                 self.recovery_start_ts = now
                 logging.debug(
@@ -631,17 +980,18 @@ class DrowsinessDetector:
 
             recovery_elapsed = now - self.recovery_start_ts
 
-            # Force AWAKE nếu đủ điều kiện
             if self.alert_on and recovery_elapsed >= self.cfg.recovery_duration_sec:
                 self.alert_on = False
                 self.alert_cross_ts = None
                 drowsy_raw = False
+                # Xóa các lần ngáp cũ để score không bật lại ngay sau recovery.
+                self.yawn_events.clear()
+                yawn_count = 0
                 logging.info(
-                    "✓ RECOVERY SUCCESS | %.1fs | eye=Opened mouth=%s perclos=%.3f yawn_age=%.1fs -> AWAKE",
+                    "RECOVERY SUCCESS | %.1fs | eye=Opened mouth=%s perclos=%.3f yawn_age=%.1fs -> AWAKE",
                     recovery_elapsed, mouth_status, perclos, last_yawn_age
                 )
         else:
-            # Reset nếu điều kiện không còn
             if self.recovery_start_ts is not None:
                 lost_elapsed = now - self.recovery_start_ts
                 logging.debug(
@@ -649,30 +999,41 @@ class DrowsinessDetector:
                     lost_elapsed, eye_status, mouth_status, perclos_ok, no_recent_yawn
                 )
             self.recovery_start_ts = None
-        #KẾT THÚC RECOVERY 
 
         drowsy = self._update_alert(drowsy_raw, now)
         status = "DROWSY" if drowsy else "AWAKE"
 
+        # Audio alert: im lặng trong lúc đang đếm recovery nếu được bật.
+        recovering = self.recovery_start_ts is not None
+        if drowsy and not (
+            self.cfg.mute_audio_during_recovery and recovering
+        ):
+            self.alarm.play(now)
+
         mouth_dbg = {
-            "ratio": mouth_ratio, "prob": prob_yawn,
+            "mar": mar, "prob": prob_yawn,
             "plateau": mt["plateau_max"], "zcr": mt["zcr"], "peaks": mt["peaks"],
             "above": mt["above_frac"], "speech_strong": int(mt["speech_strong"])
         }
         self._draw_overlay(frame, bbox=bbox, eye_status=eye_status, mouth_status=mouth_status,
                            perclos=perclos, yawn_count=yawn_count, status=status,
-                           mouth_dbg=mouth_dbg, open_dur=open_dur)
+                           mouth_dbg=mouth_dbg, open_dur=open_dur, score=score)
 
         # CSV row
         if self.save_csv_path:
+            eye_prob = self.last_eye_prob if self.last_eye_prob is not None else float("nan")
+            eye_prob_ema = self.eye_prob_ema if self.eye_prob_ema is not None else float("nan")
             with open(self.save_csv_path, "a", encoding="utf-8") as f:
-                f.write(f"{now:.3f},{perclos:.4f},{eye_status},{mouth_status},{mouth_ratio:.4f},{prob_yawn:.4f},"
-                        f"{mt['plateau_max']:.3f},{mt['zcr']:.3f},{mt['peaks']},{mt['above_frac']:.3f},{status}\n")
+                f.write(f"{now:.3f},{perclos:.4f},{span:.3f},{eye_status},{eye_prob:.4f},{eye_prob_ema:.4f},"
+                        f"{self.last_eye_source},{mouth_status},{mar:.4f},{prob_yawn:.4f},"
+                        f"{mt['plateau_max']:.3f},{mt['zcr']:.3f},{mt['peaks']},{mt['above_frac']:.3f},"
+                        f"{score:.3f},{status}\n")
 
         self._update_fps()
         return frame
 
-    def _draw_overlay(self, frame, bbox, eye_status, mouth_status, perclos, yawn_count, status, mouth_dbg=None, open_dur=0.0):
+    def _draw_overlay(self, frame, bbox, eye_status, mouth_status, perclos, yawn_count, status,
+                      mouth_dbg=None, open_dur=0.0, score=0.0):
         h, w = frame.shape[:2]
         if bbox is not None:
             x1, y1, x2, y2 = bbox
@@ -680,19 +1041,33 @@ class DrowsinessDetector:
             x1, y1, x2, y2 = 20, 40, 20, 40
 
         status_color = (0, 0, 255) if status == "DROWSY" else (0, 255, 0)
-        cv2.putText(frame, f"Eyes: {eye_status}", (x1, max(20, y1 - 30)), self.font, 0.6, self.colors['eye'], 2)
+
+        # Visual alert: viền đỏ quanh khung hình khi DROWSY
+        if status == "DROWSY":
+            cv2.rectangle(frame, (0, 0), (w - 1, h - 1), (0, 0, 255), 6)
+
+        # Eye debug
+        eye_dbg = f"Eyes: {eye_status}"
+        if eye_status != "-":
+            if self.last_eye_prob is not None and self.eye_prob_ema is not None:
+                eye_dbg += f" p={self.last_eye_prob:.2f} ema={self.eye_prob_ema:.2f}"
+            eye_dbg += f" src={self.last_eye_source}"
+            if self.last_gaze_down_like:
+                eye_dbg += " gaze-down"
+        cv2.putText(frame, eye_dbg, (x1, max(20, y1 - 30)), self.font, 0.52, self.colors['eye'], 2)
+
         if mouth_dbg:
-            cv2.putText(frame, f"Mouth: {mouth_status} open={open_dur:.1f}s r={mouth_dbg['ratio']:.2f} p={mouth_dbg['prob']:.2f}",
+            cv2.putText(frame, f"Mouth: {mouth_status} open={open_dur:.1f}s MAR={mouth_dbg['mar']:.2f} p={mouth_dbg['prob']:.2f} src={self.last_mouth_source}",
                         (x1, max(20, y1 - 60)), self.font, 0.55, self.colors['mouth'], 2)
             cv2.putText(frame, f"plateau={mouth_dbg['plateau']:.2f}s zcr={mouth_dbg['zcr']:.1f} peaks={mouth_dbg['peaks']} above={mouth_dbg['above']:.2f} talkS={mouth_dbg['speech_strong']}",
                         (x1, min(h - 35, y2 + 45)), self.font, 0.5, (200, 200, 200), 1)
         else:
             cv2.putText(frame, f"Mouth: {mouth_status}", (x1, max(20, y1 - 60)), self.font, 0.6, self.colors['mouth'], 2)
 
-        cv2.putText(frame, f"Status: {status}", (x1, max(20, y1 - 90)), self.font, 0.7, status_color, 2)
+        cv2.putText(frame, f"Status: {status} | Score: {score:.2f}", (x1, max(20, y1 - 90)), self.font, 0.7, status_color, 2)
         cv2.putText(frame, f"PERCLOS: {perclos:.2f} | yawns@60s: {yawn_count}", (x1, min(h - 10, y2 + 20)),
                     self.font, 0.55, (255, 255, 255), 2)
-        cv2.putText(frame, f"FPS: {self._fps:.1f}", (10, h - 10), self.font, 0.6, (255, 255, 255), 2)
+        cv2.putText(frame, f"FPS: {self._fps:.1f} | YOLO: {self.torch_device}", (10, h - 10), self.font, 0.6, (255, 255, 255), 2)
 
     def _update_fps(self):
         self._fps_cnt += 1
@@ -702,7 +1077,7 @@ class DrowsinessDetector:
             self._fps_cnt = 0
             self._fps_ts = now
         if now - self._fps_log_window_start >= 10.0:
-            logging.info("Avg FPS (last 10s): %.2f", self._fps)
+            logging.info("FPS snapshot: %.2f", self._fps)
             self._fps_log_window_start = now
 
 
@@ -714,11 +1089,29 @@ def setup_logger(level="INFO"):
     )
 
 
+def ask_device_mode():
+    """Hỏi người dùng chọn thiết bị: 1 = GPU, 2 = CPU. Trả về 'gpu' hoặc 'cpu'."""
+    print("\n=== CHỌN THIẾT BỊ ===")
+    print("  1 - GPU")
+    print("  2 - CPU")
+    while True:
+        choice = input("Nhập 1 hoặc 2 rồi nhấn Enter: ").strip()
+        if choice == "1":
+            return "gpu"
+        if choice == "2":
+            return "cpu"
+        print("Không hợp lệ, vui lòng nhập 1 hoặc 2.")
+
+
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model-dir", type=str, default=os.getenv("MODEL_DIR", "models"))
+    parser = argparse.ArgumentParser(
+        description="Real-time driver drowsiness detection using YOLOv8, Haar Cascades and CNN."
+    )
+    parser.add_argument("--model-dir", type=str, default=_default_model_dir(),
+                        help="Folder chứa model (mặc định: $MODEL_DIR, sau đó ./Models hoặc ./models)")
     parser.add_argument("--camera", type=int, default=0)
-    parser.add_argument("--width", type=int, default=0, help="Resize width (0=keep)")
+    parser.add_argument("--width", type=int, default=640,
+                        help="Resize frame width để chạy nhanh hơn (mặc định 640, 0 = giữ nguyên)")
     parser.add_argument("--log-level", type=str, default="INFO",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
     parser.add_argument("--detect-interval", type=int, default=None,
@@ -727,18 +1120,65 @@ def main():
                         help="Downscale width for YOLO (e.g., 640). 0 = disable")
     parser.add_argument("--gray-eye", action="store_true", help="Convert eye crop to grayscale before model")
     parser.add_argument("--gray-mouth", action="store_true", help="Convert mouth crop to grayscale before model")
-    # Guard
+
+    # Eye thresholds / Haar
+    parser.add_argument("--eye-open-prob-thr", type=float, default=None,
+                        help="P(Open) >= thr -> Opened (default 0.70)")
+    parser.add_argument("--eye-closed-prob-thr", type=float, default=None,
+                        help="P(Open) <= thr -> Closed (default 0.40)")
+    parser.add_argument("--eye-min-neighbors", type=int, default=None,
+                        help="Haar eye minNeighbors (default 4)")
+    parser.add_argument("--eye-clahe", action="store_true",
+                        help="Enable CLAHE fallback for eye localization (chậm hơn)")
+    parser.add_argument("--eye-every", type=int, default=None,
+                        help="Chạy Haar+CNN mắt mỗi N frame (default 1)")
+    parser.add_argument("--mouth-every", type=int, default=None,
+                        help="Chạy Haar+CNN miệng mỗi N frame (default 2)")
+    parser.add_argument("--eye-haar-every", type=int, default=None,
+                        help="Chạy Haar mắt mỗi N lần chạy pipeline mắt (default 3)")
+    parser.add_argument("--eye-rgb", action="store_true",
+                        help="Đổi BGR->RGB trước khi đưa vào eye CNN (nếu model train bằng ảnh RGB)")
+    parser.add_argument("--mouth-rgb", action="store_true",
+                        help="Đổi BGR->RGB trước khi đưa vào mouth CNN")
+    parser.add_argument("--eye-invert", action="store_true",
+                        help="Dùng nếu output eye model là P(Closed) thay vì P(Open)")
+    parser.add_argument("--show-eye-crop", action="store_true",
+                        help="Hiện cửa sổ phụ với ảnh crop mắt đang đưa vào CNN (để debug)")
+    parser.add_argument("--no-mouth-roi-fallback", action="store_true",
+                        help="Disable fallback ROI when Haar misses the mouth")
+    parser.add_argument("--show-mouth-crop", action="store_true",
+                        help="Hiện cửa sổ phụ với ảnh crop miệng đang đưa vào CNN (để debug)")
+    parser.add_argument("--no-eye-roi-fallback", action="store_true",
+                        help="Disable fallback ROI when Haar misses the eye (miss -> Unknown)")
+    parser.add_argument("--eye-closed-debounce", type=float, default=None,
+                        help="Seconds the eye must stay closed to be confirmed (default 0.15)")
+
+    # Gaze guard
+    parser.add_argument("--use-gaze-guard", action="store_true",
+                        help="Enable gaze-down guard (suppress false 'Closed' when looking down)")
     parser.add_argument("--gaze-down-ratio", type=float, default=None,
                         help="Lower-half mean < ratio * upper-half mean => gaze down (default 0.85)")
-    parser.add_argument("--eye-closed-debounce", type=float, default=None,
-                        help="Seconds to confirm eye-closed (default 0.30)")
     parser.add_argument("--gaze-min-delta", type=float, default=None,
-                        help="Min relative delta (top-bottom)/top to consider gaze-down, default 0.08)")
+                        help="Min relative delta (top-bottom)/top to consider gaze-down (default 0.08)")
     parser.add_argument("--gaze-min-bright", type=float, default=None,
-                        help="Min top brightness to evaluate gaze-down, default 20.0)")
+                        help="Min top brightness to evaluate gaze-down (default 20.0)")
+    parser.add_argument("--gaze-guard-override", type=float, default=None,
+                        help="If P(Open) <= this, stay Closed even when gaze-down (default 0.15)")
+
     # YOLO thresholds
     parser.add_argument("--yolo-conf", type=float, default=None, help="YOLO confidence threshold (default 0.50)")
     parser.add_argument("--yolo-iou", type=float, default=None, help="YOLO NMS IoU threshold (default 0.45)")
+    parser.add_argument(
+        "--yolo-device",
+        type=str,
+        default="auto",
+        help="YOLO device: auto, cpu, cuda, cuda:0, cuda:1, ... (default: auto). "
+             "Bị ghi đè nếu dùng menu hoặc --device.",
+    )
+    # Công tắc GPU/CPU
+    parser.add_argument("--device", type=str, default=None,
+                        choices=["gpu", "cpu"],
+                        help="Bỏ qua câu hỏi và chọn luôn GPU hoặc CPU")
     # CSV
     parser.add_argument("--save-csv", type=str, default=None, help="Path to save time-series CSV")
     # Recovery CLI arguments
@@ -748,35 +1188,85 @@ def main():
                         help="Max PERCLOS for recovery (default 0.15)")
     parser.add_argument("--recovery-yawn-cooldown", type=float, default=None,
                         help="No yawn in last N seconds (default 3.0)")
+    # Audio
+    parser.add_argument("--no-audio", action="store_true", help="Tắt cảnh báo âm thanh")
 
     args = parser.parse_args()
 
     setup_logger(args.log_level)
     cv2.setUseOptimized(True)
 
+    # ---- Chọn GPU / CPU (phải làm trước khi TensorFlow chạy bất kỳ phép tính nào) ----
+    mode = args.device or ask_device_mode()
+
+    if mode == "cpu":
+        args.yolo_device = "cpu"
+        try:
+            tf.config.set_visible_devices([], "GPU")   # ép TensorFlow chạy CPU
+        except RuntimeError as e:
+            logging.warning("Could not hide GPU from TensorFlow: %s", e)
+    else:
+        args.yolo_device = "cuda"   # không có GPU thì code tự lùi về CPU và báo warning
+
+    logging.info("Device mode: %s", mode.upper())
+
     cfg = DrowsyConfig(
         model_dir=args.model_dir,
         gray_eye=args.gray_eye,
-        gray_mouth=args.gray_mouth
+        gray_mouth=args.gray_mouth,
+        enable_audio=not args.no_audio,
+        use_gaze_guard=args.use_gaze_guard,
+        eye_clahe_fallback=args.eye_clahe,
+        eye_roi_fallback=not args.no_eye_roi_fallback,
+        mouth_roi_fallback=not args.no_mouth_roi_fallback,
+        eye_rgb=args.eye_rgb,
+        mouth_rgb=args.mouth_rgb,
+        eye_invert=args.eye_invert,
+        yolo_device=args.yolo_device,
     )
+    if args.eye_every is not None:
+        cfg.eye_every_n = max(1, int(args.eye_every))
+    if args.mouth_every is not None:
+        cfg.mouth_every_n = max(1, int(args.mouth_every))
+    if args.eye_haar_every is not None:
+        cfg.eye_haar_every_n = max(1, int(args.eye_haar_every))
     if args.detect_interval is not None:
         cfg.detect_every_n_frames = max(1, int(args.detect_interval))
     if args.yolo_downscale is not None:
         cfg.yolo_downscale_width = max(0, int(args.yolo_downscale))
+
+    # Eye
+    if args.eye_open_prob_thr is not None:
+        cfg.eye_open_prob_thr = float(args.eye_open_prob_thr)
+    if args.eye_closed_prob_thr is not None:
+        cfg.eye_closed_prob_thr = float(args.eye_closed_prob_thr)
+    if cfg.eye_closed_prob_thr >= cfg.eye_open_prob_thr:
+        raise ValueError(
+            "eye_closed_prob_thr must be smaller than eye_open_prob_thr. "
+            f"Got closed={cfg.eye_closed_prob_thr} open={cfg.eye_open_prob_thr}"
+        )
+    if args.eye_min_neighbors is not None:
+        cfg.eye_min_neighbors = max(1, int(args.eye_min_neighbors))
+    if args.eye_closed_debounce is not None:
+        cfg.eye_closed_debounce_sec = max(0.0, float(args.eye_closed_debounce))
+
+    # Gaze
     if args.gaze_down_ratio is not None:
         cfg.gaze_down_ratio = float(args.gaze_down_ratio)
-    if args.eye_closed_debounce is not None:
-        cfg.eye_closed_debounce_sec = float(args.eye_closed_debounce)
     if args.gaze_min_delta is not None:
         cfg.gaze_down_min_delta = float(args.gaze_min_delta)
     if args.gaze_min_bright is not None:
         cfg.gaze_min_brightness = float(args.gaze_min_bright)
+    if args.gaze_guard_override is not None:
+        cfg.gaze_guard_override_prob = float(args.gaze_guard_override)
+
+    # YOLO
     if args.yolo_conf is not None:
         cfg.yolo_conf = float(args.yolo_conf)
     if args.yolo_iou is not None:
         cfg.yolo_iou = float(args.yolo_iou)
 
-    # Apply recovery settings from CLI
+    # Recovery
     if args.recovery_duration is not None:
         cfg.recovery_duration_sec = float(args.recovery_duration)
     if args.recovery_perclos is not None:
@@ -784,21 +1274,51 @@ def main():
     if args.recovery_yawn_cooldown is not None:
         cfg.recovery_yawn_cooldown = float(args.recovery_yawn_cooldown)
 
+    logging.info("Model dir: %s", cfg.model_dir)
+    logging.info("Schedule: YOLO/%d | eye/%d | mouth/%d frames | width=%d",
+                 cfg.detect_every_n_frames, cfg.eye_every_n, cfg.mouth_every_n, args.width)
+    logging.info(
+        "Eye config: open>=%.2f closed<=%.2f debounce=%.2fs minNeighbors=%d CLAHE=%s gaze_guard=%s",
+        cfg.eye_open_prob_thr, cfg.eye_closed_prob_thr, cfg.eye_closed_debounce_sec,
+        cfg.eye_min_neighbors, cfg.eye_clahe_fallback, cfg.use_gaze_guard
+    )
     logging.info(
         "Recovery config: duration=%.1fs perclos<%.2f yawn_cooldown=%.1fs",
         cfg.recovery_duration_sec, cfg.recovery_perclos_thr, cfg.recovery_yawn_cooldown
     )
+    logging.info("Audio alert: %s", "ON" if cfg.enable_audio else "OFF")
 
-    # Log versions & device
-    gpus = tf.config.list_physical_devices('GPU')
-    logging.info("Versions: opencv=%s | tensorflow=%s | ultralytics=%s",
-                 cv2.__version__, tf.__version__, getattr(ulx, "__version__", "unknown"))
-    logging.info("Device: %s", "GPU" if gpus else "CPU")
+    # Log versions & device (phản ánh đúng lựa chọn GPU/CPU)
+    tf_gpus = tf.config.get_visible_devices("GPU")
+    logging.info(
+        "Versions: opencv=%s | tensorflow=%s | ultralytics=%s | torch=%s",
+        cv2.__version__,
+        tf.__version__,
+        getattr(ulx, "__version__", "unknown"),
+        torch.__version__,
+    )
+    logging.info(
+        "Device (TensorFlow - eye/mouth CNN): %s",
+        "GPU" if tf_gpus else "CPU",
+    )
+    torch_dev = resolve_torch_device(cfg.yolo_device)
+    if torch_dev.startswith("cuda"):
+        try:
+            logging.info(
+                "Device (PyTorch - YOLO face): GPU (%s)",
+                torch.cuda.get_device_name(int(torch_dev.split(":")[1])),
+            )
+        except Exception:
+            logging.info("Device (PyTorch - YOLO face): GPU")
+    else:
+        logging.info("Device (PyTorch - YOLO face): CPU")
+    logging.info("YOLO requested device: %s", cfg.yolo_device)
+    logging.info("Haar cascades (OpenCV): CPU")
 
     try:
         detector = DrowsinessDetector(cfg, save_csv_path=args.save_csv)
         cap = cv2.VideoCapture(args.camera)
-        #cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
+        # cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
         try:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         except Exception:
@@ -823,7 +1343,11 @@ def main():
                 frame = cv2.resize(frame, (args.width, int(frame.shape[0] * r)))
             frame = cv2.flip(frame, 1)
             out = detector.detect_drowsiness(frame)
-            cv2.imshow("Drowsiness Detection (precedence-fixed)", out)
+            cv2.imshow("Drowsiness Detection", out)
+            if args.show_mouth_crop and detector.last_mouth_crop is not None:
+                cv2.imshow("mouth crop (CNN input)", cv2.resize(detector.last_mouth_crop, (256, 256)))
+            if args.show_eye_crop and detector.last_eye_crop is not None:
+                cv2.imshow("eye crop (CNN input)", cv2.resize(detector.last_eye_crop, (256, 256)))
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
     except KeyboardInterrupt:
@@ -842,4 +1366,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
