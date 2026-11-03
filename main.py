@@ -94,13 +94,26 @@ class DrowsyConfig:
     haar_work_width: int = 200         # thu nhỏ ảnh xám về bề rộng này trước khi Haar (0 = tắt)
 
     # Chẩn đoán CNN (dùng khi nhận diện Closed/Open bị sai)
-    eye_rgb: bool = False              # BGR -> RGB trước khi đưa vào eye CNN
-    mouth_rgb: bool = False            # BGR -> RGB trước khi đưa vào mouth CNN
+    # Keras (flow_from_directory / flow_from_dataframe) đọc ảnh train dạng RGB,
+    # còn OpenCV đọc webcam dạng BGR -> mặc định đổi sang RGB cho khớp lúc train.
+    eye_rgb: bool = True               # BGR -> RGB trước khi đưa vào eye CNN
+    mouth_rgb: bool = True             # BGR -> RGB trước khi đưa vào mouth CNN
     eye_invert: bool = False           # True nếu output eye model thực ra là P(Closed)
     # Haar (train trên mắt mở) hay miss khi mắt NHẮM -> dùng ROI dự phòng để CNN quyết định
     eye_roi_fallback: bool = True
     # Haar miệng hay miss khi miệng há to (ngáp) -> dùng ROI dự phòng để CNN quyết định
     mouth_roi_fallback: bool = True
+    # Crop miệng đưa vào CNN: ảnh 'yawn' lúc train cao hơn rộng (h/w ~1.2),
+    # còn box Haar khi há miệng thường dẹt (MAR ~0.6) -> cắt mất phần miệng.
+    # Nới box: thêm lề mouth_crop_pad mỗi phía, và kéo chiều cao tối thiểu = aspect * chiều rộng.
+    # MAR vẫn tính trên box Haar gốc, chỉ ảnh đưa vào CNN là được nới.
+    # Làm mượt trạng thái miệng (giống mắt): trước đây chỉ 1 frame P(Yawn) < 0.5
+    # là bộ đếm thời gian mở miệng bị reset về 0 -> trạng thái nhấp nháy, không đạt 1.4 s.
+    mouth_ema_alpha: float = 0.4          # EMA cho P(Yawn)
+    mouth_off_prob_thr: float = 0.30      # hysteresis: đang mở thì chỉ coi là đóng khi EMA < ngưỡng này
+    mouth_gap_tolerance_sec: float = 0.5  # cho phép "rớt" tối đa 0.5 s mà không reset bộ đếm
+    mouth_crop_pad: float = 0.15
+    mouth_crop_min_aspect: float = 1.0
 
     # Guard "nhìn xuống"
     use_gaze_guard: bool = False
@@ -127,6 +140,11 @@ class DrowsyConfig:
     # Drowsiness score: score = max(eye, perclos, yawn) đã chuẩn hóa về [0, 1]
     # Cảnh báo khi score >= drowsy_score_thr (nên để 1.0 = ngưỡng của từng thành phần)
     drowsy_score_thr: float = 1.0
+    # Báo động 2 mức: nhắm mắt liên tục >= eye_continuous_closed_sec -> báo NGAY
+    # (không chờ thêm on_min_sec), vì chính thời gian nhắm đã là bộ lọc nhiễu
+    # (chớp mắt thường ~0.1-0.4 s). Euro NCAP mô tả microsleep ~1-2 s nhắm mắt.
+    # Ngáp và PERCLOS vẫn đi qua on_min_sec như cũ (dấu hiệu sớm, ưu tiên ít báo nhầm).
+    microsleep_immediate: bool = True
 
     # Audio alert
     enable_audio: bool = True
@@ -340,12 +358,19 @@ class DrowsinessDetector:
         self.mar_hist = deque(maxlen=1000)
         self.mouth_prob_hist = deque(maxlen=1000)
         self.mouth_open_start_ts = None
+        self.mouth_prob_ema = None
+        self._mouth_is_open = False
+        self._mouth_last_open_ts = None
         self.mouth_yawn_start_ts = None
         self.last_yawn_set_ts = 0.0
         self.talking_since_ts = None
 
         self.alert_on = False
         self.alert_cross_ts = None
+        self.alert_reason = ""
+        # Khi chạy trên file video: dùng thời gian của video thay vì đồng hồ máy,
+        # để các ngưỡng thời gian (1.4 s, 1.5 s...) đúng dù xử lý nhanh/chậm hơn thời gian thực.
+        self.clock_override = None
         self.last_score = 0.0
 
         # Recovery state
@@ -361,10 +386,15 @@ class DrowsinessDetector:
         self._mouth_miss_streak = 0
 
         # CSV logging
+        # Nhãn thật do người dùng bấm phím 'y' (1 = đang ngáp), ghi kèm mỗi dòng CSV
+        self.gt_yawn = 0
+        self._csv_f = None
         if self.save_csv_path:
-            with open(self.save_csv_path, "w", encoding="utf-8") as f:
-                f.write("ts,perclos,perclos_span,eye_status,eye_prob,eye_prob_ema,eye_source,"
-                        "mouth_status,mar,mouth_prob,plateau,zcr,peaks,above,score,status\n")
+            # Mở file 1 lần, ghi theo dòng (không mở/đóng file mỗi frame -> đỡ tốn thời gian)
+            self._csv_f = open(self.save_csv_path, "w", encoding="utf-8", buffering=1)
+            self._csv_f.write("ts,perclos,perclos_span,eye_status,eye_prob,eye_prob_ema,eye_source,"
+                              "mouth_status,mar,mouth_prob,plateau,zcr,peaks,above,score,status,"
+                              "mouth_source,mouth_prob_ema,alert_reason,gt_yawn\n")
 
         logging.info("DrowsinessDetector initialized.")
 
@@ -598,7 +628,7 @@ class DrowsinessDetector:
             self.eye_state = "Unknown"
 
         raw_state = self.eye_state
-        now = time.time()
+        now = self._now()
 
         # -------- Gaze guard: chỉ chặn khi mắt chưa nhắm "chắc chắn" --------
         if (raw_state == "Closed" and cfg.use_gaze_guard and gaze_down_like
@@ -635,7 +665,7 @@ class DrowsinessDetector:
         mar = 0.0
         prob_yawn = 0.0
         open_dur = 0.0
-        now = time.time()
+        now = self._now()
         self.last_mouth_crop = None
 
         if face_roi is None or face_roi.size == 0:
@@ -676,7 +706,16 @@ class DrowsinessDetector:
         crop = None
         if sel is not None:
             mx, my, mw, mh = sel
-            crop = mouth_region[my:my + mh, mx:mx + mw]
+            pad = cfg.mouth_crop_pad
+            cx = mx + mw / 2.0
+            cw = mw * (1 + 2 * pad)
+            ch = max(mh * (1 + 2 * pad), cfg.mouth_crop_min_aspect * cw)
+            # Haar thường bám môi trên khi há miệng -> giữ mép trên, kéo dài xuống dưới
+            cy1 = int(max(0, my - pad * mh))
+            cy2 = int(min(rh, cy1 + ch))
+            cx1 = int(max(0, cx - cw / 2.0))
+            cx2 = int(min(rw, cx + cw / 2.0))
+            crop = mouth_region[cy1:cy2, cx1:cx2]
             if crop.size == 0:
                 crop = None
 
@@ -687,15 +726,35 @@ class DrowsinessDetector:
             mouth_inp = self._prep_keras_input(crop, to_gray=cfg.gray_mouth, to_rgb=cfg.mouth_rgb)
             prob_yawn = float(self._mouth_fn(mouth_inp).numpy()[0][0])
 
+            # EMA làm mượt P(Yawn): 1 frame lệch không làm đổi trạng thái
+            if self.mouth_prob_ema is None:
+                self.mouth_prob_ema = prob_yawn
+            else:
+                a = cfg.mouth_ema_alpha
+                self.mouth_prob_ema = a * prob_yawn + (1 - a) * self.mouth_prob_ema
+            p_s = self.mouth_prob_ema
+
             if source == "haar":
                 mar = mh / max(1.0, mw)
                 open_gate = mar >= cfg.mar_thr
             else:
                 # Không có MAR đáng tin -> để CNN quyết định
                 open_gate = True
-                mar = (cfg.mar_thr + 0.05) if prob_yawn >= cfg.mouth_prob_thr else 0.0
+                mar = (cfg.mar_thr + 0.05) if p_s >= cfg.mouth_prob_thr else 0.0
 
-            mouth_open_now = open_gate and (prob_yawn >= cfg.mouth_prob_thr)
+            # Hysteresis: bắt đầu "mở" khi (MAR gate và EMA >= mouth_prob_thr);
+            # đã mở thì giữ cho tới khi EMA < mouth_off_prob_thr
+            if self._mouth_is_open:
+                self._mouth_is_open = p_s >= cfg.mouth_off_prob_thr
+            else:
+                self._mouth_is_open = open_gate and (p_s >= cfg.mouth_prob_thr)
+            if self._mouth_is_open:
+                self._mouth_last_open_ts = now
+
+            # Cho phép rớt ngắn (<= mouth_gap_tolerance_sec) mà không reset bộ đếm
+            recently_open = (self._mouth_last_open_ts is not None
+                             and now - self._mouth_last_open_ts <= cfg.mouth_gap_tolerance_sec)
+            mouth_open_now = self._mouth_is_open or (recently_open and self.mouth_open_start_ts is not None)
 
             if mouth_open_now:
                 if self.mouth_open_start_ts is None:
@@ -720,9 +779,17 @@ class DrowsinessDetector:
                 self.mouth_open_start_ts = None
                 self.mouth_yawn_start_ts = None
         else:
-            self.mouth_open_start_ts = None
-            self.mouth_yawn_start_ts = None
-            status = "Normal"
+            recently_open = (self._mouth_last_open_ts is not None
+                             and now - self._mouth_last_open_ts <= cfg.mouth_gap_tolerance_sec)
+            if recently_open and self.mouth_open_start_ts is not None:
+                # Mất crop trong thời gian ngắn -> giữ bộ đếm
+                open_dur = now - self.mouth_open_start_ts
+                status = "Yawn" if open_dur > cfg.yawn_sure_open_sec else "Opening"
+            else:
+                self.mouth_open_start_ts = None
+                self.mouth_yawn_start_ts = None
+                self._mouth_is_open = False
+                status = "Normal"
 
         return status, mar, prob_yawn, open_dur
 
@@ -844,8 +911,11 @@ class DrowsinessDetector:
                 self.alert_cross_ts = None
         return self.alert_on
 
+    def _now(self):
+        return self.clock_override if self.clock_override is not None else time.time()
+
     def detect_drowsiness(self, frame):
-        now = time.time()
+        now = self._now()
         self.frame_idx += 1
 
         face_roi, bbox = self._detect_face(frame)
@@ -1000,7 +1070,18 @@ class DrowsinessDetector:
                 )
             self.recovery_start_ts = None
 
+        eye_dur_now = (now - self.eye_closed_start_ts) if self.eye_closed_start_ts is not None else 0.0
+        if (self.cfg.microsleep_immediate and not self.alert_on
+                and eye_dur_now >= self.cfg.eye_continuous_closed_sec):
+            self.alert_on = True
+            self.alert_cross_ts = None
+            self.alert_reason = "eyes"
+            logging.info("MICROSLEEP ALERT | eyes closed %.2fs", eye_dur_now)
+        was_on = self.alert_on
         drowsy = self._update_alert(drowsy_raw, now)
+        if drowsy and not was_on:
+            self.alert_reason = max(_parts, key=_parts.get)
+            logging.info("DROWSY ALERT | reason=%s | score=%.2f", self.alert_reason, score)
         status = "DROWSY" if drowsy else "AWAKE"
 
         # Audio alert: im lặng trong lúc đang đếm recovery nếu được bật.
@@ -1023,11 +1104,12 @@ class DrowsinessDetector:
         if self.save_csv_path:
             eye_prob = self.last_eye_prob if self.last_eye_prob is not None else float("nan")
             eye_prob_ema = self.eye_prob_ema if self.eye_prob_ema is not None else float("nan")
-            with open(self.save_csv_path, "a", encoding="utf-8") as f:
-                f.write(f"{now:.3f},{perclos:.4f},{span:.3f},{eye_status},{eye_prob:.4f},{eye_prob_ema:.4f},"
-                        f"{self.last_eye_source},{mouth_status},{mar:.4f},{prob_yawn:.4f},"
-                        f"{mt['plateau_max']:.3f},{mt['zcr']:.3f},{mt['peaks']},{mt['above_frac']:.3f},"
-                        f"{score:.3f},{status}\n")
+            self._csv_f.write(f"{now:.3f},{perclos:.4f},{span:.3f},{eye_status},{eye_prob:.4f},{eye_prob_ema:.4f},"
+                              f"{self.last_eye_source},{mouth_status},{mar:.4f},{prob_yawn:.4f},"
+                              f"{mt['plateau_max']:.3f},{mt['zcr']:.3f},{mt['peaks']},{mt['above_frac']:.3f},"
+                              f"{score:.3f},{status},{self.last_mouth_source},"
+                              f"{(self.mouth_prob_ema if self.mouth_prob_ema is not None else float('nan')):.4f},"
+                              f"{self.alert_reason if self.alert_on else ''},{self.gt_yawn}\n")
 
         self._update_fps()
         return frame
@@ -1057,7 +1139,7 @@ class DrowsinessDetector:
         cv2.putText(frame, eye_dbg, (x1, max(20, y1 - 30)), self.font, 0.52, self.colors['eye'], 2)
 
         if mouth_dbg:
-            cv2.putText(frame, f"Mouth: {mouth_status} open={open_dur:.1f}s MAR={mouth_dbg['mar']:.2f} p={mouth_dbg['prob']:.2f} src={self.last_mouth_source}",
+            cv2.putText(frame, f"Mouth: {mouth_status} open={open_dur:.1f}s MAR={mouth_dbg['mar']:.2f} p={mouth_dbg['prob']:.2f} ema={(self.mouth_prob_ema if self.mouth_prob_ema is not None else 0):.2f} src={self.last_mouth_source}",
                         (x1, max(20, y1 - 60)), self.font, 0.55, self.colors['mouth'], 2)
             cv2.putText(frame, f"plateau={mouth_dbg['plateau']:.2f}s zcr={mouth_dbg['zcr']:.1f} peaks={mouth_dbg['peaks']} above={mouth_dbg['above']:.2f} talkS={mouth_dbg['speech_strong']}",
                         (x1, min(h - 35, y2 + 45)), self.font, 0.5, (200, 200, 200), 1)
@@ -1092,8 +1174,9 @@ def setup_logger(level="INFO"):
 def ask_device_mode():
     """Hỏi người dùng chọn thiết bị: 1 = GPU, 2 = CPU. Trả về 'gpu' hoặc 'cpu'."""
     print("\n=== CHỌN THIẾT BỊ ===")
-    print("  1 - GPU")
-    print("  2 - CPU")
+    print("  1 - GPU  (YOLO chạy GPU; CNN mắt/miệng và Haar vẫn chạy CPU vì")
+    print("            TensorFlow trên Windows và OpenCV bản pip không hỗ trợ GPU)")
+    print("  2 - CPU  (tất cả chạy CPU)")
     while True:
         choice = input("Nhập 1 hoặc 2 rồi nhấn Enter: ").strip()
         if choice == "1":
@@ -1110,6 +1193,12 @@ def main():
     parser.add_argument("--model-dir", type=str, default=_default_model_dir(),
                         help="Folder chứa model (mặc định: $MODEL_DIR, sau đó ./Models hoặc ./models)")
     parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--video", default=None,
+                        help="Chạy trên file video thay vì webcam (dùng thời gian của video, vd. YawDD)")
+    parser.add_argument("--no-display", action="store_true",
+                        help="Không mở cửa sổ hiển thị (chạy nhanh hơn khi xử lý video)")
+    parser.add_argument("--no-microsleep-immediate", action="store_true",
+                        help="Tắt báo động ngay khi nhắm mắt lâu (quay về logic cũ, chờ thêm on_min_sec)")
     parser.add_argument("--width", type=int, default=640,
                         help="Resize frame width để chạy nhanh hơn (mặc định 640, 0 = giữ nguyên)")
     parser.add_argument("--log-level", type=str, default="INFO",
@@ -1139,7 +1228,29 @@ def main():
     parser.add_argument("--eye-rgb", action="store_true",
                         help="Đổi BGR->RGB trước khi đưa vào eye CNN (nếu model train bằng ảnh RGB)")
     parser.add_argument("--mouth-rgb", action="store_true",
-                        help="Đổi BGR->RGB trước khi đưa vào mouth CNN")
+                        help="(Mặc định đã bật) Đổi BGR->RGB trước khi đưa vào mouth CNN")
+    parser.add_argument("--eye-bgr", action="store_true",
+                        help="Đưa ảnh BGR (không đổi màu) vào eye CNN, dùng cho model cũ")
+    parser.add_argument("--mouth-bgr", action="store_true",
+                        help="Đưa ảnh BGR (không đổi màu) vào mouth CNN, dùng cho model cũ")
+    parser.add_argument("--mouth-crop-pad", type=float, default=None,
+                        help="Lề thêm mỗi phía quanh box miệng, tỉ lệ theo box (default 0.15)")
+    parser.add_argument("--mouth-crop-aspect", type=float, default=None,
+                        help="Chiều cao tối thiểu của crop miệng = aspect x chiều rộng (default 1.0)")
+    parser.add_argument("--duration", type=float, default=0,
+                        help="Tự dừng sau N giây (0 = chạy đến khi bấm q). Dùng để đo FPS công bằng")
+    parser.add_argument("--mouth-model", default=None,
+                        help="Đường dẫn file .h5 của mouth CNN (mặc định <model-dir>/mouth_detector.h5)")
+    parser.add_argument("--eye-model", default=None,
+                        help="Đường dẫn file .h5 của eye CNN (mặc định <model-dir>/eye_detector.h5)")
+    parser.add_argument("--mar-thr", type=float, default=None,
+                        help="Ngưỡng MAR (cao/rộng box miệng Haar) để coi là miệng mở (default 0.34; nhỏ hơn = nhạy hơn)")
+    parser.add_argument("--mouth-off-prob-thr", type=float, default=None,
+                        help="Đang mở miệng thì chỉ coi là đóng khi EMA P(Yawn) < ngưỡng này (default 0.30)")
+    parser.add_argument("--mouth-gap", type=float, default=None,
+                        help="Số giây cho phép P(Yawn) rớt mà không reset bộ đếm mở miệng (default 0.5)")
+    parser.add_argument("--mouth-prob-thr", type=float, default=None,
+                        help="Ngưỡng P(Yawn) để coi là miệng mở/ngáp (default 0.50)")
     parser.add_argument("--eye-invert", action="store_true",
                         help="Dùng nếu output eye model là P(Closed) thay vì P(Open)")
     parser.add_argument("--show-eye-crop", action="store_true",
@@ -1219,11 +1330,30 @@ def main():
         eye_clahe_fallback=args.eye_clahe,
         eye_roi_fallback=not args.no_eye_roi_fallback,
         mouth_roi_fallback=not args.no_mouth_roi_fallback,
-        eye_rgb=args.eye_rgb,
-        mouth_rgb=args.mouth_rgb,
+        microsleep_immediate=not args.no_microsleep_immediate,
+        eye_rgb=not args.eye_bgr,
+        mouth_rgb=not args.mouth_bgr,
         eye_invert=args.eye_invert,
         yolo_device=args.yolo_device,
     )
+    if args.mouth_model:
+        cfg.mouth_keras = os.path.abspath(args.mouth_model)
+    if args.eye_model:
+        cfg.eye_keras = os.path.abspath(args.eye_model)
+    logging.info("Eye model: %s", os.path.join(cfg.model_dir, cfg.eye_keras))
+    logging.info("Mouth model: %s", os.path.join(cfg.model_dir, cfg.mouth_keras))
+    if args.mouth_crop_pad is not None:
+        cfg.mouth_crop_pad = max(0.0, float(args.mouth_crop_pad))
+    if args.mouth_crop_aspect is not None:
+        cfg.mouth_crop_min_aspect = max(0.0, float(args.mouth_crop_aspect))
+    if args.mar_thr is not None:
+        cfg.mar_thr = float(args.mar_thr)
+    if args.mouth_off_prob_thr is not None:
+        cfg.mouth_off_prob_thr = float(args.mouth_off_prob_thr)
+    if args.mouth_gap is not None:
+        cfg.mouth_gap_tolerance_sec = max(0.0, float(args.mouth_gap))
+    if args.mouth_prob_thr is not None:
+        cfg.mouth_prob_thr = float(args.mouth_prob_thr)
     if args.eye_every is not None:
         cfg.eye_every_n = max(1, int(args.eye_every))
     if args.mouth_every is not None:
@@ -1283,6 +1413,11 @@ def main():
         cfg.eye_min_neighbors, cfg.eye_clahe_fallback, cfg.use_gaze_guard
     )
     logging.info(
+        "Mouth config: MAR>=%.2f P(Yawn) on>=%.2f off<%.2f gap=%.1fs yawn_after=%.1fs crop_pad=%.2f crop_aspect=%.2f",
+        cfg.mar_thr, cfg.mouth_prob_thr, cfg.mouth_off_prob_thr, cfg.mouth_gap_tolerance_sec,
+        cfg.yawn_sure_open_sec, cfg.mouth_crop_pad, cfg.mouth_crop_min_aspect
+    )
+    logging.info(
         "Recovery config: duration=%.1fs perclos<%.2f yawn_cooldown=%.1fs",
         cfg.recovery_duration_sec, cfg.recovery_perclos_thr, cfg.recovery_yawn_cooldown
     )
@@ -1317,7 +1452,8 @@ def main():
 
     try:
         detector = DrowsinessDetector(cfg, save_csv_path=args.save_csv)
-        cap = cv2.VideoCapture(args.camera)
+        is_video = bool(args.video)
+        cap = cv2.VideoCapture(args.video if is_video else args.camera)
         # cap = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
         try:
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -1325,7 +1461,7 @@ def main():
             pass
 
         if not cap.isOpened():
-            raise ValueError("Could not open camera.")
+            raise ValueError(f"Could not open {'video ' + args.video if is_video else 'camera'}.")
         logging.info("Press 'q' to quit.")
 
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -1333,23 +1469,47 @@ def main():
         fps_cam = cap.get(cv2.CAP_PROP_FPS) or 0.0
         logging.info("Camera opened: %dx%d @ %.1f FPS (reported)", w, h, fps_cam)
 
+        t_start = time.time()
+        frame_idx = 0
+        video_fps = fps_cam if (is_video and fps_cam > 0) else 30.0
         while True:
+            if args.duration and time.time() - t_start >= args.duration:
+                logging.info("Reached --duration %.0f s, stopping.", args.duration)
+                break
             ok, frame = cap.read()
             if not ok:
-                logging.warning("Frame read error")
+                if is_video:
+                    logging.info("End of video (%d frames).", frame_idx)
+                else:
+                    logging.warning("Frame read error")
                 break
             if args.width and frame.shape[1] != args.width:
                 r = args.width / frame.shape[1]
                 frame = cv2.resize(frame, (args.width, int(frame.shape[0] * r)))
-            frame = cv2.flip(frame, 1)
+            if is_video:
+                # Đồng hồ = thời gian trong video (không lật ảnh: video không phải gương)
+                detector.clock_override = frame_idx / video_fps
+            else:
+                frame = cv2.flip(frame, 1)
+            frame_idx += 1
             out = detector.detect_drowsiness(frame)
+            if args.no_display:
+                continue
+            if detector.gt_yawn:
+                cv2.putText(out, "LABEL: YAWN (press y to stop)", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
             cv2.imshow("Drowsiness Detection", out)
             if args.show_mouth_crop and detector.last_mouth_crop is not None:
                 cv2.imshow("mouth crop (CNN input)", cv2.resize(detector.last_mouth_crop, (256, 256)))
             if args.show_eye_crop and detector.last_eye_crop is not None:
                 cv2.imshow("eye crop (CNN input)", cv2.resize(detector.last_eye_crop, (256, 256)))
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
                 break
+            if key == ord('y'):
+                # Bấm 'y' khi bắt đầu ngáp, bấm 'y' lần nữa khi ngậm miệng lại
+                detector.gt_yawn = 1 - detector.gt_yawn
+                logging.info("Ground-truth yawn label: %s", "ON" if detector.gt_yawn else "OFF")
     except KeyboardInterrupt:
         logging.info("Interrupted by user.")
     except Exception as e:

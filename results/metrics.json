@@ -1,0 +1,52 @@
+{
+  "eye": {
+    "n_val": 24103,
+    "accuracy": 0.9644,
+    "precision_Close-Eyes": 0.968,
+    "recall_Close-Eyes": 0.9583,
+    "f1_Close-Eyes": 0.9631,
+    "confusion_matrix": {
+      "labels": [
+        "Close-Eyes",
+        "Open-Eyes"
+      ],
+      "rows_true_cols_pred": [
+        [
+          11218,
+          488
+        ],
+        [
+          371,
+          12026
+        ]
+      ]
+    },
+    "split": "subject-independent",
+    "n_train": 56854
+  },
+  "mouth": {
+    "n_val": 1024,
+    "accuracy": 0.9775,
+    "precision_yawn": 0.9782,
+    "recall_yawn": 0.9763,
+    "f1_yawn": 0.9773,
+    "confusion_matrix": {
+      "labels": [
+        "no yawn",
+        "yawn"
+      ],
+      "rows_true_cols_pred": [
+        [
+          507,
+          11
+        ],
+        [
+          12,
+          494
+        ]
+      ]
+    },
+    "split": "random (no subject IDs)",
+    "n_train": 4095
+  }
+}
